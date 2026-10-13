@@ -36,4 +36,4 @@ USER appuser
 EXPOSE 8080
 
 # Default command — change to your project's entrypoint
-CMD ["python", "main.py"]
+CMD ["python", "grade.py"]
