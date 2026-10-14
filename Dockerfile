@@ -50,5 +50,5 @@ USER appuser
 # Cloud Run listens on port 8080
 EXPOSE 8080
 
-# Start the grading application
-CMD ["python", "grade.py"]
+# Start the grading application as a web service for Cloud Run
+CMD ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-8080} app:app --workers 1 --timeout 120"]
