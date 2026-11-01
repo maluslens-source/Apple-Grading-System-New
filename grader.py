@@ -42,7 +42,7 @@ class AppleGrader:
     # These MUST match what was used during training.
     # Do not change them unless you retrain the classifier.
     CLASSIFIER_INPUT_SIZE = 380     # pixels fed into EfficientNet
-    DETECTOR_IMGSZ = 1024           # resolution for YOLO inference
+    DETECTOR_IMGSZ = 640 #1024           # resolution for YOLO inference
     DETECTOR_CONF = 0.40            # minimum detection confidence
     DETECTOR_IOU = 0.50             # NMS IoU threshold
     PADDING_RATIO = 0.02            # crop padding (2%)
@@ -57,9 +57,13 @@ class AppleGrader:
         print(f"Using device: {self.device}")
 
         # ── Load detector ────────────────────────────────────────────
+        #self.detector = YOLO(detector_path)
+        #print(f"Detector loaded: {detector_path}")
         self.detector = YOLO(detector_path)
-        print(f"Detector loaded: {detector_path}")
+        self.detector.to(self.device)
 
+        if self.device.type == "cuda":
+            self.detector.model.half()
         # ── Load classifier ──────────────────────────────────────────
         self.classifier = timm.create_model('efficientnet_b0', pretrained=False)
         in_features = self.classifier.classifier.in_features
@@ -117,112 +121,236 @@ class AppleGrader:
                 os.unlink(detect_path)
             except OSError:
                 pass
+def grade(self, image_path, a_threshold=0.50):
+    """
+    Grade all apples in a tray image.
 
-    def grade(self, image_path, a_threshold=0.50):
-        """
-        Grade all apples in a tray image.
+    Parameters
+    ----------
+    image_path : str or Path
+        Path to the tray image (JPG, PNG).
+    a_threshold : float, optional
+        Minimum probability to classify as Grade A.
+        Lower (0.35–0.40) = more apples classified as A.
+        Higher (0.55–0.60) = stricter, more classified as B.
+        Default: 0.50
 
-        Parameters
-        ----------
-        image_path : str or Path
-            Path to the tray image (JPG, PNG).
-        a_threshold : float, optional
-            Minimum probability to classify as Grade A.
-            Lower (0.35–0.40) = more apples classified as A.
-            Higher (0.55–0.60) = stricter, more classified as B.
-            Default: 0.50
+    Returns
+    -------
+    dict with keys:
+        image         : filename
+        total_detected: number of apples found
+        grade_A_count : number classified as Grade A
+        grade_B_count : number classified as Grade B
+        pct_A         : percentage Grade A
+        pct_B         : percentage Grade B
+        apples        : list of per-apple results
+    """
+    image_path = str(image_path)
 
-        Returns
-        -------
-        dict with keys:
-            image         : filename
-            total_detected: number of apples found
-            grade_A_count : number classified as Grade A
-            grade_B_count : number classified as Grade B
-            pct_A         : percentage Grade A
-            pct_B         : percentage Grade B
-            apples        : list of per-apple results
-        """
-        image_path = str(image_path)
+    # ── Stage 1: Detect apples ───────────────────────────────────
+    img, detect_path, is_temp = self._read_image(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    h, w = img.shape[:2]
 
-        # ── Stage 1: Detect apples ───────────────────────────────────
-        img, detect_path, is_temp = self._read_image(image_path)
-        if img is None:
-            raise FileNotFoundError(f"Could not read image: {image_path}")
-        h, w = img.shape[:2]
+    device_arg = 0 if self.device.type == "cuda" else "cpu"
 
-        results = self.detector.predict(
-            source=detect_path,
-            imgsz=self.DETECTOR_IMGSZ,
-            conf=self.DETECTOR_CONF,
-            iou=self.DETECTOR_IOU,
-            verbose=False,
-        )
+    results = self.detector.predict(
+        source=detect_path,
+        imgsz=self.DETECTOR_IMGSZ,
+        conf=self.DETECTOR_CONF,
+        iou=self.DETECTOR_IOU,
+        verbose=False,
+        device=device_arg,
+        half=(self.device.type == "cuda"),
+        max_det=500,
+        augment=False,
+    )
 
-        detections = results[0].boxes
+    detections = results[0].boxes
 
-        if len(detections) == 0:
-            return {
-                "image": Path(image_path).name,
-                "total_detected": 0,
-                "grade_A_count": 0,
-                "grade_B_count": 0,
-                "pct_A": 0.0,
-                "pct_B": 0.0,
-                "apples": [],
-            }
-
-        # ── Stage 2: Classify each detected apple ────────────────────
-        apples = []
-
-        for box in detections:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-            det_conf = box.conf.item()
-
-            # Apply padding (must match training extraction)
-            bw, bh = x2 - x1, y2 - y1
-            x1 = max(0, x1 - int(bw * self.PADDING_RATIO))
-            y1 = max(0, y1 - int(bh * self.PADDING_RATIO))
-            x2 = min(w, x2 + int(bw * self.PADDING_RATIO))
-            y2 = min(h, y2 + int(bh * self.PADDING_RATIO))
-
-            crop = img[y1:y2, x1:x2]
-            if crop.size == 0:
-                continue
-
-            # Classify — no preprocessing, let the model see what it trained on
-            crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            tensor = self.transform(crop_rgb).unsqueeze(0).to(self.device)
-
-            with torch.no_grad():
-                output = self.classifier(tensor)
-                probs = torch.softmax(output, dim=1)
-                prob_a = probs[0, 0].item()
-
-                grade = "Grade_A" if prob_a >= a_threshold else "Grade_B"
-                conf = prob_a if grade == "Grade_A" else probs[0, 1].item()
-
-            apples.append({
-                "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                "grade": grade,
-                "grade_confidence": round(conf, 3),
-                "detection_confidence": round(det_conf, 3),
-            })
-
-        # ── Aggregate results ────────────────────────────────────────
-        a_count = sum(1 for a in apples if a["grade"] == "Grade_A")
-        b_count = len(apples) - a_count
-        total = len(apples)
+    if len(detections) == 0:
         self._cleanup_temp(detect_path, is_temp)
         return {
             "image": Path(image_path).name,
-            "total_detected": total,
-            "grade_A_count": a_count,
-            "grade_B_count": b_count,
-            "pct_A": round(a_count / total * 100, 2) if total > 0 else 0.0,
-            "pct_B": round(b_count / total * 100, 2) if total > 0 else 0.0,
-            "apples": apples,
+            "total_detected": 0,
+            "grade_A_count": 0,
+            "grade_B_count": 0,
+            "pct_A": 0.0,
+            "pct_B": 0.0,
+            "apples": [],
         }
+
+    # ── Stage 2: Classify all detected apples in batches ─────────
+    apple_crops = []
+    apple_boxes = []
+
+    for box in detections:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+        det_conf = float(box.conf.item())
+
+        # Apply padding (must match training extraction)
+        bw, bh = x2 - x1, y2 - y1
+        x1 = max(0, x1 - int(bw * self.PADDING_RATIO))
+        y1 = max(0, y1 - int(bh * self.PADDING_RATIO))
+        x2 = min(w, x2 + int(bw * self.PADDING_RATIO))
+        y2 = min(h, y2 + int(bh * self.PADDING_RATIO))
+
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+
+        crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        apple_crops.append(self.transform(crop_rgb))
+        apple_boxes.append({
+            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+            "detection_confidence": det_conf,
+        })
+
+    apples = []
+    if apple_crops:
+        batch = torch.stack(apple_crops).to(self.device)
+
+        with torch.inference_mode():
+            logits = self.classifier(batch)
+            probs = torch.softmax(logits, dim=1)
+
+        for idx, item in enumerate(apple_boxes):
+            prob_a = float(probs[idx, 0].item())
+            prob_b = float(probs[idx, 1].item())
+
+            grade = "Grade_A" if prob_a >= a_threshold else "Grade_B"
+            conf = prob_a if grade == "Grade_A" else prob_b
+
+            apples.append({
+                "bbox": item["bbox"],
+                "grade": grade,
+                "grade_confidence": round(conf, 3),
+                "detection_confidence": round(item["detection_confidence"], 3),
+            })
+
+    # ── Aggregate results ────────────────────────────────────────
+    a_count = sum(1 for a in apples if a["grade"] == "Grade_A")
+    b_count = len(apples) - a_count
+    total = len(apples)
+
+    self._cleanup_temp(detect_path, is_temp)
+
+    return {
+        "image": Path(image_path).name,
+        "total_detected": total,
+        "grade_A_count": a_count,
+        "grade_B_count": b_count,
+        "pct_A": round(a_count / total * 100, 2) if total > 0 else 0.0,
+        "pct_B": round(b_count / total * 100, 2) if total > 0 else 0.0,
+        "apples": apples,
+    }
+    # def grade(self, image_path, a_threshold=0.50):
+    #     """
+    #     Grade all apples in a tray image.
+
+    #     Parameters
+    #     ----------
+    #     image_path : str or Path
+    #         Path to the tray image (JPG, PNG).
+    #     a_threshold : float, optional
+    #         Minimum probability to classify as Grade A.
+    #         Lower (0.35–0.40) = more apples classified as A.
+    #         Higher (0.55–0.60) = stricter, more classified as B.
+    #         Default: 0.50
+
+    #     Returns
+    #     -------
+    #     dict with keys:
+    #         image         : filename
+    #         total_detected: number of apples found
+    #         grade_A_count : number classified as Grade A
+    #         grade_B_count : number classified as Grade B
+    #         pct_A         : percentage Grade A
+    #         pct_B         : percentage Grade B
+    #         apples        : list of per-apple results
+    #     """
+    #     image_path = str(image_path)
+
+    #     # ── Stage 1: Detect apples ───────────────────────────────────
+    #     img, detect_path, is_temp = self._read_image(image_path)
+    #     if img is None:
+    #         raise FileNotFoundError(f"Could not read image: {image_path}")
+    #     h, w = img.shape[:2]
+
+    #     results = self.detector.predict(
+    #         source=detect_path,
+    #         imgsz=self.DETECTOR_IMGSZ,
+    #         conf=self.DETECTOR_CONF,
+    #         iou=self.DETECTOR_IOU,
+    #         verbose=False,
+    #     )
+
+    #     detections = results[0].boxes
+
+    #     if len(detections) == 0:
+    #         return {
+    #             "image": Path(image_path).name,
+    #             "total_detected": 0,
+    #             "grade_A_count": 0,
+    #             "grade_B_count": 0,
+    #             "pct_A": 0.0,
+    #             "pct_B": 0.0,
+    #             "apples": [],
+    #         }
+
+    #     # ── Stage 2: Classify each detected apple ────────────────────
+    #     apples = []
+
+    #     for box in detections:
+    #         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+    #         det_conf = box.conf.item()
+
+    #         # Apply padding (must match training extraction)
+    #         bw, bh = x2 - x1, y2 - y1
+    #         x1 = max(0, x1 - int(bw * self.PADDING_RATIO))
+    #         y1 = max(0, y1 - int(bh * self.PADDING_RATIO))
+    #         x2 = min(w, x2 + int(bw * self.PADDING_RATIO))
+    #         y2 = min(h, y2 + int(bh * self.PADDING_RATIO))
+
+    #         crop = img[y1:y2, x1:x2]
+    #         if crop.size == 0:
+    #             continue
+
+    #         # Classify — no preprocessing, let the model see what it trained on
+    #         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+    #         tensor = self.transform(crop_rgb).unsqueeze(0).to(self.device)
+
+    #         with torch.no_grad():
+    #             output = self.classifier(tensor)
+    #             probs = torch.softmax(output, dim=1)
+    #             prob_a = probs[0, 0].item()
+
+    #             grade = "Grade_A" if prob_a >= a_threshold else "Grade_B"
+    #             conf = prob_a if grade == "Grade_A" else probs[0, 1].item()
+
+    #         apples.append({
+    #             "bbox": [int(x1), int(y1), int(x2), int(y2)],
+    #             "grade": grade,
+    #             "grade_confidence": round(conf, 3),
+    #             "detection_confidence": round(det_conf, 3),
+    #         })
+
+    #     # ── Aggregate results ────────────────────────────────────────
+    #     a_count = sum(1 for a in apples if a["grade"] == "Grade_A")
+    #     b_count = len(apples) - a_count
+    #     total = len(apples)
+    #     self._cleanup_temp(detect_path, is_temp)
+    #     return {
+    #         "image": Path(image_path).name,
+    #         "total_detected": total,
+    #         "grade_A_count": a_count,
+    #         "grade_B_count": b_count,
+    #         "pct_A": round(a_count / total * 100, 2) if total > 0 else 0.0,
+    #         "pct_B": round(b_count / total * 100, 2) if total > 0 else 0.0,
+    #         "apples": apples,
+    #     }
 
     def grade_and_annotate(self, image_path, output_path=None, a_threshold=0.50):
         """
