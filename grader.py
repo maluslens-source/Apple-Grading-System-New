@@ -121,7 +121,7 @@ class AppleGrader:
                 os.unlink(detect_path)
             except OSError:
                 pass
-def grade(self, image_path, a_threshold=0.50):
+    def grade(self, image_path, a_threshold=0.50):
     """
     Grade all apples in a tray image.
 
